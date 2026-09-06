@@ -15,29 +15,35 @@ path — Git sync reads `template.yaml` straight from this repository.
 | `.cfn-deployments/main.yaml` | Git sync deployment file: all parameters, all tags |
 | `prereq-roles.yaml` | The one role the stack cannot create for itself. Deployed once, by CLI |
 | `check-roles.sh` | Verifies every role's permissions against IAM's own evaluator |
-| `architecture.drawio.svg` | The diagram above — viewable as an image, editable in draw.io |
+| `architecture.drawio` | The diagram source, for editing in the draw.io app |
+| `architecture.drawio.svg` | The same diagram rendered — what GitHub displays above |
 | `.github/workflows/lint.yml` | `cfn-lint` on pull requests. Deploys nothing, has no AWS access |
 
 That's the repository. Seven files.
 
 ## The diagram
 
-`architecture.drawio.svg` is a real SVG *and* a draw.io document. The draw.io XML
-lives in the file's `content` attribute, so the same file both renders here and
-opens as a fully editable diagram — no separate source, no export step, nothing
-to keep in sync.
+Two files, same diagram:
 
-To edit it:
+| File | Use |
+|---|---|
+| `architecture.drawio` | Open this to **edit**. Native draw.io XML, uncompressed so git diffs are readable |
+| `architecture.drawio.svg` | What renders above in this README, and the file to hand in |
 
-- **draw.io desktop / [app.diagrams.net](https://app.diagrams.net)** — *File → Open*,
-  pick the `.svg`. Save writes both the picture and the embedded XML back.
-- **VS Code** — the *Draw.io Integration* extension opens it on click.
+To edit: **draw.io desktop**, **[app.diagrams.net](https://app.diagrams.net)**
+(*File → Open*), or the **Draw.io Integration** extension in VS Code, which opens
+either file on click.
 
-When saving from draw.io, keep the format as **Editable SVG** (draw.io calls it
-"SVG" with *Include a copy of my diagram* ticked). Saving as a plain SVG drops the
-embedded XML and the file stops being editable.
+After editing `architecture.drawio`, re-export the SVG so the README picture
+matches: *File → Export as → SVG*, with **Include a copy of my diagram** ticked,
+saved over `architecture.drawio.svg`. That checkbox is what keeps the SVG itself
+openable in draw.io — without it you get a flat picture.
 
-To hand in a PNG instead, *File → Export as → PNG* from the same file.
+For a PNG deliverable: *File → Export as → PNG* from either file.
+
+The layout is hand-routed rather than auto-arranged — connectors carry explicit
+waypoints so nothing crosses a shape. If you move things, draw.io will re-route
+them and you may need to nudge a few by hand.
 
 ## Why one template and not nested stacks
 
