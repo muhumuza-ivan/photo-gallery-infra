@@ -18,7 +18,12 @@ parameters:
   GitHubOrg: muhumuza-ivan
   AppRepoName: photo-gallery-app
   AppRepoBranch: main
-  CreateOidcProvider: 'true'
+
+  # An IAM OIDC provider is account-scoped and only one may exist per URL. This
+  # account already has one for token.actions.githubusercontent.com, so the stack
+  # reuses it instead of trying to create a second and failing with AlreadyExists.
+  CreateOidcProvider: 'false'
+  ExistingOidcProviderArn: 'arn:aws:iam::765812221756:oidc-provider/token.actions.githubusercontent.com'
 
   # This GitHub account issues immutable subject claims - the owner and repository
   # IDs are embedded, so the classic repo:owner/name form would never match and the
