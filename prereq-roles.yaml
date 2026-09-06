@@ -1,7 +1,8 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >
-  Photo Gallery - deployment role. Creates the IAM role that CloudFormation
-  assumes to build everything in template.yaml.
+  Photo Gallery - the two roles the Git sync setup needs before it can run:
+  the role CloudFormation assumes to build template.yaml, and the role the Git
+  sync service assumes to read the repository and drive change sets.
 
   This is the one thing template.yaml cannot create for itself: CloudFormation
   needs a role in order to create resources, and that role cannot be created by
@@ -16,10 +17,6 @@ Description: >
   It is deliberately NOT part of the Git sync flow: giving a deployment the
   power to rewrite its own permissions is the loop you do not want.
 
-  The Git sync role is the other prerequisite and is not here on purpose - see
-  the README. Let the console create it ("Create new role"); it generates the
-  current trust policy for the sync service. check-roles.sh verifies the result.
-
 Parameters:
   ProjectName:
     Type: String
@@ -29,8 +26,29 @@ Parameters:
     Type: String
     Default: photo-gallery
     Description: >
-      Name of the stack this role may be used for. The trust policy is pinned to
-      it, so a leaked role reference cannot be used to build a different stack.
+      Name of the stack these roles may be used for. The trust policy is pinned
+      to it, so a leaked role reference cannot be used to build a different stack.
+
+  GitSyncConnectionArn:
+    Type: String
+    AllowedPattern: '^arn:aws[a-z-]*:code(star-)?connections:[a-z0-9-]+:\d{12}:connection/.+$'
+    Description: >
+      ARN of the GitHub connection created in the CloudFormation or Developer
+      Tools console. Authorising a connection needs a human OAuth handshake, so
+      it is the one step that cannot be scripted - everything after it can.
+
+  GitSyncServicePrincipal:
+    Type: String
+    Default: repository.sync.codeconnections.amazonaws.com
+    Description: >
+      Service principal allowed to assume the Git sync role. AWS-owned, so it is
+      read from the account rather than assumed: this value is the one on the
+      AWSServiceRoleForGitSync service-linked role that AWS creates alongside a
+      Git sync setup. check-roles.sh prints it, so a drift shows up there first.
+
+      Note it is 'repository.sync...', not 'cloudformation.sync...'. If the sync
+      configuration ever refuses the role, re-read the value and override this
+      parameter rather than editing the policy below.
 
 Resources:
 
@@ -174,7 +192,99 @@ Resources:
                       - rds.amazonaws.com
                       - ecs.application-autoscaling.amazonaws.com
 
+  # ===========================================================================
+  # The Git sync role. This is what turns a push into a deployment: the sync
+  # service assumes it, reads the repository through the connection, and creates
+  # and executes a change set on the stack.
+  #
+  # It cannot build anything itself - it holds no ec2, rds, ecs or s3
+  # permissions. All it can do is drive change sets and hand CloudFormation the
+  # execution role above. That separation is the point: the thing triggered by a
+  # git push has no power of its own.
+  # ===========================================================================
+  GitSyncRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-git-sync'
+      Description: Assumed by CloudFormation Git sync to deploy this stack from GitHub.
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: !Ref GitSyncServicePrincipal
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: read-the-repository
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Both action prefixes: the service was renamed from
+              # codestar-connections to codeconnections and either may be the one
+              # evaluated. Same permission, same resource - not a widening.
+              - Sid: UseThisConnectionOnly
+                Effect: Allow
+                Action:
+                  - codestar-connections:UseConnection
+                  - codeconnections:UseConnection
+                Resource: !Ref GitSyncConnectionArn
+
+        - PolicyName: drive-change-sets-on-this-stack
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: ThisStackOnly
+                Effect: Allow
+                Action:
+                  - cloudformation:CreateChangeSet
+                  - cloudformation:DeleteChangeSet
+                  - cloudformation:DescribeChangeSet
+                  - cloudformation:ExecuteChangeSet
+                  - cloudformation:ListChangeSets
+                  - cloudformation:CreateStack
+                  - cloudformation:UpdateStack
+                  - cloudformation:DescribeStacks
+                  - cloudformation:DescribeStackEvents
+                  - cloudformation:DescribeStackResource
+                  - cloudformation:DescribeStackResources
+                  - cloudformation:GetTemplate
+                  - cloudformation:GetTemplateSummary
+                  - cloudformation:TagResource
+                  - cloudformation:UntagResource
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${StackName}/*'
+                  - !Sub 'arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:changeSet/*'
+
+              # These two carry no resource, so they cannot be scoped. Both are
+              # read-only and reveal nothing about existing stacks.
+              - Sid: TemplateInspectionHasNoResourceForm
+                Effect: Allow
+                Action:
+                  - cloudformation:ValidateTemplate
+                  - cloudformation:ListStacks
+                Resource: '*'
+
+              # Handing the build over. The sync role cannot create resources
+              # itself; it can only ask CloudFormation to do so as this one role.
+              - Sid: PassOnlyTheExecutionRole
+                Effect: Allow
+                Action: iam:PassRole
+                Resource: !GetAtt CfnExecutionRole.Arn
+                Condition:
+                  StringEquals:
+                    iam:PassedToService: cloudformation.amazonaws.com
+
 Outputs:
+  GitSyncRoleArn:
+    Description: >
+      Select this as the Git sync IAM role instead of letting the console create
+      one, or pass it to `codeconnections create-sync-configuration --role-arn`.
+    Value: !GetAtt GitSyncRole.Arn
+    Export:
+      Name: !Sub '${ProjectName}-GitSyncRoleArn'
   CfnExecutionRoleArn:
     Description: >
       Select this as "IAM role for CloudFormation" when creating the Git sync

@@ -242,21 +242,55 @@ trust_check "${PROJECT}-task"            "task role trusts ecs-tasks only"      
 trust_check "${PROJECT}-task-execution"  "execution role trusts ecs-tasks only"           'ecs-tasks\.amazonaws\.com'      present
 
 # =============================================================================
-# Git sync role - created by the CloudFormation console, not by this repo.
+# 9. Git sync role - what turns a push into a deployment.
 # =============================================================================
+if role_header "${PROJECT}-git-sync" "assumed by CloudFormation Git sync"; then
+  STACK_ARN="arn:${PARTITION}:cloudformation:${REGION}:${ACCOUNT}:stack/${STACK}/*"
+  check "${PROJECT}-git-sync" allow cloudformation:CreateChangeSet  "$STACK_ARN"
+  check "${PROJECT}-git-sync" allow cloudformation:ExecuteChangeSet "$STACK_ARN"
+  check "${PROJECT}-git-sync" allow cloudformation:DescribeStacks   "$STACK_ARN"
+  check "${PROJECT}-git-sync" allow iam:PassRole \
+        "arn:${PARTITION}:iam::${ACCOUNT}:role/${PROJECT}-cfn-execution" \
+        iam:PassedToService cloudformation.amazonaws.com
+  # it triggers builds; it must not be able to perform them
+  check "${PROJECT}-git-sync" deny  ec2:CreateVpc        '*'
+  check "${PROJECT}-git-sync" deny  iam:CreateRole       "arn:${PARTITION}:iam::${ACCOUNT}:role/${PROJECT}-task"
+  check "${PROJECT}-git-sync" deny  iam:PassRole         "$OTHER_ROLE_ARN"
+  check "${PROJECT}-git-sync" deny  cloudformation:DeleteStack "$STACK_ARN"
+  check "${PROJECT}-git-sync" deny  cloudformation:CreateChangeSet \
+        "arn:${PARTITION}:cloudformation:${REGION}:${ACCOUNT}:stack/some-other-stack/*"
+fi
+
+# The Git sync service principal is AWS-owned, so it is read from the account
+# rather than trusted from the template. AWS creates AWSServiceRoleForGitSync
+# alongside a Git sync setup; whatever principal that role trusts is the value
+# ours must match. Getting this wrong is silent - the role simply never gets
+# assumed and pushes stop deploying - so it is asserted, not just printed.
 echo
-echo "Git sync role"
-SYNC_ROLES="$(aws iam list-roles --query "Roles[?contains(RoleName,'GitSync')||contains(RoleName,'SyncRole')].RoleName" --output text 2>/dev/null)"
-if [[ -n "$SYNC_ROLES" && "$SYNC_ROLES" != "None" ]]; then
-  for r in $SYNC_ROLES; do
-    printf '   %sfound%s  %s\n' "$D" "$N" "$r"
-    check "$r" allow cloudformation:CreateChangeSet "arn:${PARTITION}:cloudformation:${REGION}:${ACCOUNT}:stack/${STACK}/*"
-    check "$r" allow iam:PassRole "arn:${PARTITION}:iam::${ACCOUNT}:role/${PROJECT}-cfn-execution" iam:PassedToService cloudformation.amazonaws.com
-  done
-else
+echo "Git sync service principal"
+SLR_PRINCIPAL="$(aws iam get-role --role-name AWSServiceRoleForGitSync \
+  --query 'Role.AssumeRolePolicyDocument.Statement[0].Principal.Service' \
+  --output text 2>/dev/null)"
+
+if [[ -z "$SLR_PRINCIPAL" || "$SLR_PRINCIPAL" == "None" ]]; then
   skip=$((skip + 1))
-  printf '   %sSKIP%s  no Git sync role found - create it with "Create new role"\n' "$Y" "$N"
-  printf '         in the sync configuration wizard, then re-run this script.\n'
+  printf '   %sSKIP%s  AWSServiceRoleForGitSync not present - nothing to compare against\n' "$Y" "$N"
+elif role_exists "${PROJECT}-git-sync"; then
+  OURS="$(aws iam get-role --role-name "${PROJECT}-git-sync" \
+    --query 'Role.AssumeRolePolicyDocument.Statement[0].Principal.Service' --output text)"
+  if [[ "$OURS" == "$SLR_PRINCIPAL" ]]; then
+    pass=$((pass + 1))
+    printf '   %sPASS%s  our role trusts %s\n' "$G" "$N" "$OURS"
+  else
+    fail=$((fail + 1))
+    printf '   %sFAIL%s  principal mismatch - the sync will never fire\n' "$R" "$N"
+    printf '         ours : %s\n' "$OURS"
+    printf '         AWS  : %s\n' "$SLR_PRINCIPAL"
+    printf '         fix  : redeploy prereq-roles.yaml with\n'
+    printf '                --parameter-overrides GitSyncServicePrincipal=%s\n' "$SLR_PRINCIPAL"
+  fi
+else
+  printf '   %snote%s  AWS uses %s\n' "$D" "$N" "$SLR_PRINCIPAL"
 fi
 
 # ------------------------------------------------------------------ summary --
