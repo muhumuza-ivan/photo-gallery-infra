@@ -232,6 +232,46 @@ Resources:
                   - codeconnections:UseConnection
                 Resource: !Ref GitSyncConnectionArn
 
+              # The repository link and sync configuration are separate resources
+              # from the connection, created by the wizard, with their own ARNs.
+              - Sid: ReadTheLinkAndSyncConfiguration
+                Effect: Allow
+                Action:
+                  - codestar-connections:GetConnection
+                  - codestar-connections:GetRepositoryLink
+                  - codestar-connections:GetRepositorySyncStatus
+                  - codestar-connections:GetSyncConfiguration
+                  - codeconnections:GetConnection
+                  - codeconnections:GetRepositoryLink
+                  - codeconnections:GetRepositorySyncStatus
+                  - codeconnections:GetSyncConfiguration
+                Resource: '*'
+
+        # ---------------------------------------------------------------------
+        # Git sync reacts to pushes through an EventBridge rule that it creates
+        # and owns. Without these three the wizard refuses the role outright,
+        # before it ever tries to sync - the error names them explicitly.
+        #
+        # The rule name is chosen by the service, so this cannot be pinned to a
+        # single rule; it is scoped to EventBridge rules in this account and
+        # region, which is as tight as the service allows.
+        # ---------------------------------------------------------------------
+        - PolicyName: manage-the-sync-trigger
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: OwnTheSyncEventRule
+                Effect: Allow
+                Action:
+                  - events:PutRule
+                  - events:PutTargets
+                  - events:DescribeRule
+                  - events:DeleteRule
+                  - events:RemoveTargets
+                  - events:ListTargetsByRule
+                  - events:TagResource
+                Resource: !Sub 'arn:${AWS::Partition}:events:${AWS::Region}:${AWS::AccountId}:rule/*'
+
         - PolicyName: drive-change-sets-on-this-stack
           PolicyDocument:
             Version: '2012-10-17'
