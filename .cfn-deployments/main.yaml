@@ -1,0 +1,69 @@
+# CloudFormation Git sync deployment file.
+#
+# One file, one stack, one template read straight from this repository. Edit a
+# value here or in template.yaml, push to main, and CloudFormation creates and
+# executes a change set. Nothing else is in the loop.
+#
+# These tags are applied to the stack and every resource in it.
+template-file-path: template.yaml
+parameters:
+  ProjectName: photo-gallery
+
+  # foundation -> everything except the ECS service, auto scaling and the
+  #               pipeline. Use it for the first deployment.
+  # full       -> adds them. Switch only after the application repository has
+  #               pushed its first image to ECR.
+  DeployStage: foundation
+
+  GitHubOrg: muhumuza-ivan
+  AppRepoName: photo-gallery-app
+  AppRepoBranch: main
+  CreateOidcProvider: 'true'
+
+  # This GitHub account issues immutable subject claims - the owner and repository
+  # IDs are embedded, so the classic repo:owner/name form would never match and the
+  # app workflow could not assume the role. The IDs are per-repository: this is
+  # photo-gallery-APP's prefix, not photo-gallery-infra's.
+  #
+  # Combined with AppRepoBranch, the trust policy pins the subject to exactly:
+  #   repo:muhumuza-ivan@211486075/photo-gallery-app@1358941347:ref:refs/heads/main
+  #
+  # Re-derive with:
+  #   gh api /repos/muhumuza-ivan/photo-gallery-app \
+  #     --jq '"repo:\(.owner.login)@\(.owner.id)/\(.name)@\(.id)"'
+  AppRepoSubjectPrefix: 'repo:muhumuza-ivan@211486075/photo-gallery-app@1358941347'
+
+  VpcCidr: 10.20.0.0/16
+  ContainerPort: '8080'
+  TestListenerPort: '8080'
+  TestListenerCidr: 0.0.0.0/0
+
+  DBName: gallery
+  DBMasterUsername: gallery_admin
+  DBInstanceClass: db.t3.micro
+  DBEngineVersion: '16'
+  DBAllocatedStorage: '20'
+  MultiAZ: 'true'
+  BackupRetentionDays: '7'
+
+  ImageTag: latest
+  TaskCpu: '512'
+  TaskMemory: '1024'
+  DesiredCount: '1'
+  MinCapacity: '1'
+  MaxCapacity: '4'
+  CpuTargetPercent: '60'
+  HealthCheckPath: /actuator/health
+  LogRetentionDays: '30'
+  MaxUploadMb: '10'
+
+  DeployArtifactKey: deploy/photo-gallery-deploy.zip
+  TriggerImageTag: latest
+  DeploymentConfigName: CodeDeployDefault.ECSAllAtOnce
+  BlueTerminationWaitMinutes: '5'
+tags:
+  Project: photo-gallery
+  Environment: dev
+  ManagedBy: cloudformation-git-sync
+  Owner: muhumuza
+  CostCenter: training

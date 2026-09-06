@@ -1,0 +1,186 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Photo Gallery - deployment role. Creates the IAM role that CloudFormation
+  assumes to build everything in template.yaml.
+
+  This is the one thing template.yaml cannot create for itself: CloudFormation
+  needs a role in order to create resources, and that role cannot be created by
+  the stack it enables. Deploy it once, by CLI, before creating the Git sync
+  configuration:
+
+    aws cloudformation deploy \
+      --template-file prereq-roles.yaml \
+      --stack-name photo-gallery-prereq \
+      --capabilities CAPABILITY_NAMED_IAM
+
+  It is deliberately NOT part of the Git sync flow: giving a deployment the
+  power to rewrite its own permissions is the loop you do not want.
+
+  The Git sync role is the other prerequisite and is not here on purpose - see
+  the README. Let the console create it ("Create new role"); it generates the
+  current trust policy for the sync service. check-roles.sh verifies the result.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: photo-gallery
+    Description: Must match ProjectName in .cfn-deployments/main.yaml.
+  StackName:
+    Type: String
+    Default: photo-gallery
+    Description: >
+      Name of the stack this role may be used for. The trust policy is pinned to
+      it, so a leaked role reference cannot be used to build a different stack.
+
+Resources:
+
+  CfnExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-cfn-execution'
+      Description: Assumed by CloudFormation to deploy the photo gallery stack.
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudformation.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              # Confused-deputy guards: only CloudFormation, only in this
+              # account, and only when building this stack.
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+              ArnLike:
+                aws:SourceArn: !Sub 'arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${StackName}/*'
+      Policies:
+
+        # ---------------------------------------------------------------------
+        # The fourteen services this stack touches. Actions are broad WITHIN each
+        # service and the service list is closed - the deliberate trade. A
+        # per-action allow-list reads better in a review but fails a deploy
+        # halfway through the first time it is one verb short, and a half-built
+        # stack with a Multi-AZ database in it is an expensive way to find out.
+        #
+        # What matters for least privilege is the line below this one: the role
+        # cannot touch IAM except through the scoped policy that follows.
+        # ---------------------------------------------------------------------
+        - PolicyName: infrastructure-services
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: NetworkComputeStorageAndDelivery
+                Effect: Allow
+                Action:
+                  - 'ec2:*'                       # VPC, subnets, routing, SGs, endpoints
+                  - 'elasticloadbalancing:*'      # ALB, target groups, listeners
+                  - 'ecs:*'                       # cluster, task definition, service
+                  - 'ecr:*'                       # repository + lifecycle policy
+                  - 'rds:*'                       # instance, subnet group, parameter group
+                  - 's3:*'                        # image + artifact buckets
+                  - 'cloudfront:*'                # distribution + origin access control
+                  - 'logs:*'                      # log group
+                  - 'cloudwatch:*'                # rollback alarm
+                  - 'application-autoscaling:*'   # scalable target + policy
+                  - 'codedeploy:*'                # application + deployment group
+                  - 'codepipeline:*'              # pipeline
+                  - 'events:*'                    # ECR push rule
+                  - 'secretsmanager:*'            # RDS-managed master secret
+                Resource: '*'
+
+              # RDS StorageEncrypted and the RDS-managed secret both use AWS
+              # managed keys. Creating them needs grant and describe calls.
+              - Sid: KmsForEncryptedStorageAndSecrets
+                Effect: Allow
+                Action:
+                  - kms:CreateGrant
+                  - kms:DescribeKey
+                  - kms:GenerateDataKey
+                  - kms:GenerateDataKeyWithoutPlaintext
+                  - kms:ListAliases
+                  - kms:RetireGrant
+                Resource: '*'
+
+        # ---------------------------------------------------------------------
+        # IAM, scoped. This is the half worth defending in a review: the role can
+        # only create, modify or delete roles whose names begin with the project
+        # prefix, and can only pass those same roles on to AWS services.
+        # ---------------------------------------------------------------------
+        - PolicyName: iam-scoped-to-this-project
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: ManageProjectRolesOnly
+                Effect: Allow
+                Action:
+                  - iam:CreateRole
+                  - iam:DeleteRole
+                  - iam:GetRole
+                  - iam:UpdateRole
+                  - iam:UpdateRoleDescription
+                  - iam:UpdateAssumeRolePolicy
+                  - iam:PutRolePolicy
+                  - iam:DeleteRolePolicy
+                  - iam:GetRolePolicy
+                  - iam:ListRolePolicies
+                  - iam:AttachRolePolicy
+                  - iam:DetachRolePolicy
+                  - iam:ListAttachedRolePolicies
+                  - iam:TagRole
+                  - iam:UntagRole
+                  - iam:ListRoleTags
+                Resource: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${ProjectName}-*'
+
+              # Handing the task roles to ECS, the pipeline role to CodePipeline,
+              # and so on. Same prefix restriction.
+              - Sid: PassProjectRolesToAwsServicesOnly
+                Effect: Allow
+                Action: iam:PassRole
+                Resource: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${ProjectName}-*'
+                Condition:
+                  StringEquals:
+                    iam:PassedToService:
+                      - ecs-tasks.amazonaws.com
+                      - codedeploy.amazonaws.com
+                      - codepipeline.amazonaws.com
+                      - events.amazonaws.com
+
+              # The GitHub OIDC provider. Account-scoped resource, so it cannot
+              # carry the project prefix - it is pinned by exact ARN instead.
+              - Sid: ManageGitHubOidcProvider
+                Effect: Allow
+                Action:
+                  - iam:CreateOpenIDConnectProvider
+                  - iam:DeleteOpenIDConnectProvider
+                  - iam:GetOpenIDConnectProvider
+                  - iam:TagOpenIDConnectProvider
+                  - iam:UntagOpenIDConnectProvider
+                  - iam:UpdateOpenIDConnectProviderThumbprint
+                  - iam:AddClientIDToOpenIDConnectProvider
+                  - iam:RemoveClientIDFromOpenIDConnectProvider
+                Resource: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com'
+
+              # ECS, ELB, RDS and Application Auto Scaling each create a
+              # service-linked role on first use. Restricted to those services.
+              - Sid: ServiceLinkedRolesForTheServicesAbove
+                Effect: Allow
+                Action: iam:CreateServiceLinkedRole
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    iam:AWSServiceName:
+                      - ecs.amazonaws.com
+                      - elasticloadbalancing.amazonaws.com
+                      - rds.amazonaws.com
+                      - ecs.application-autoscaling.amazonaws.com
+
+Outputs:
+  CfnExecutionRoleArn:
+    Description: >
+      Select this as "IAM role for CloudFormation" when creating the Git sync
+      configuration.
+    Value: !GetAtt CfnExecutionRole.Arn
+    Export:
+      Name: !Sub '${ProjectName}-CfnExecutionRoleArn'
+  CfnExecutionRoleName:
+    Value: !Ref CfnExecutionRole

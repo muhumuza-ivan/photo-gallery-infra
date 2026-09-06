@@ -1,0 +1,1489 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Photo Gallery - the entire system in one template: GitHub OIDC identity and ECR,
+  a two-AZ VPC with no NAT gateway, a private S3 bucket fronted by CloudFront,
+  Multi-AZ RDS PostgreSQL, an ECS Fargate service behind a public ALB, and a
+  CodeDeploy blue/green pipeline triggered by EventBridge on an ECR push.
+
+  Deployed by CloudFormation Git sync straight from this repository. There is no
+  packaging step, no artifact bucket for templates and no CI job in the loop:
+  push to main, and CloudFormation creates and executes a change set. At roughly
+  60 resources this sits far inside the 500-resource and 1 MB template limits,
+  which is why one file beats six nested stacks here.
+
+Parameters:
+
+  # --- identity ---------------------------------------------------------------
+  ProjectName:
+    Type: String
+    Default: photo-gallery
+    Description: Prefix used for resource names throughout the system.
+
+  DeployStage:
+    Type: String
+    Default: foundation
+    AllowedValues: [foundation, full]
+    Description: >
+      'foundation' creates everything except the ECS service and the deployment
+      pipeline. Use it for the first deployment: a Fargate service cannot reach a
+      steady state until an image exists in ECR, and this template creates the
+      ECR repository and the CI role that pushes to it. Once the application
+      repository has pushed its first image, set this to 'full' and push - Git
+      sync adds the service, auto scaling and the pipeline.
+
+  # --- GitHub / CI ------------------------------------------------------------
+  GitHubOrg:
+    Type: String
+    Description: GitHub organisation or username that owns the repositories.
+  AppRepoName:
+    Type: String
+    Default: photo-gallery-app
+    Description: Repository holding the Spring Boot application and Dockerfile.
+  AppRepoBranch:
+    Type: String
+    Default: main
+    Description: Only this branch may assume the CI role.
+  AppRepoSubjectPrefix:
+    Type: String
+    Default: ''
+    Description: >
+      Leave empty unless GitHub issues immutable subject claims for your account,
+      in which case the numeric owner and repository IDs are embedded in the
+      subject and the classic repo:owner/name form will never match:
+
+        classic     repo:my-org/photo-gallery-app
+        immutable   repo:my-org@211486075/photo-gallery-app@1358946729
+
+      Paste the prefix GitHub shows for the APPLICATION repository - the IDs are
+      per-repository, so the infrastructure repo's prefix is the wrong one. Stop
+      before the ':ref:...' segment; the branch is appended from AppRepoBranch.
+  CreateOidcProvider:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: >
+      Set to false if token.actions.githubusercontent.com is already registered
+      as an IAM OIDC provider in this account.
+  ExistingOidcProviderArn:
+    Type: String
+    Default: ''
+    Description: Required only when CreateOidcProvider is false.
+
+  # --- network ----------------------------------------------------------------
+  VpcCidr:
+    Type: String
+    Default: 10.20.0.0/16
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$'
+  ContainerPort:
+    Type: Number
+    Default: 8080
+    Description: Port the Spring Boot container listens on.
+  TestListenerPort:
+    Type: Number
+    Default: 8080
+    Description: ALB listener used by CodeDeploy to validate the green task set.
+  TestListenerCidr:
+    Type: String
+    Default: 0.0.0.0/0
+    Description: >
+      Narrow this to your own /32 for a real deployment. Left open by default so
+      a reviewer can hit the green environment during the blue/green demo.
+
+  # --- database ---------------------------------------------------------------
+  DBName:
+    Type: String
+    Default: gallery
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9_]*$'
+  DBMasterUsername:
+    Type: String
+    Default: gallery_admin
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9_]*$'
+  DBInstanceClass:
+    Type: String
+    Default: db.t3.micro
+    AllowedValues: [db.t3.micro, db.t3.small, db.t3.medium]
+  DBEngineVersion:
+    Type: String
+    Default: '16'
+    Description: Major version only - RDS selects the latest supported minor.
+  DBAllocatedStorage:
+    Type: Number
+    Default: 20
+    MinValue: 20
+    MaxValue: 100
+  MultiAZ:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Keep true for the high-availability requirement.
+  BackupRetentionDays:
+    Type: Number
+    Default: 7
+    MinValue: 1
+    MaxValue: 35
+
+  # --- compute ----------------------------------------------------------------
+  ImageTag:
+    Type: String
+    Default: latest
+    Description: >
+      Tag used for the FIRST task definition only. Afterwards CodeDeploy owns the
+      running revision - see the note in the README.
+  TaskCpu:
+    Type: String
+    Default: '512'
+    AllowedValues: ['256', '512', '1024', '2048']
+  TaskMemory:
+    Type: String
+    Default: '1024'
+    AllowedValues: ['512', '1024', '2048', '3072', '4096']
+  DesiredCount:
+    Type: Number
+    Default: 1
+  MinCapacity:
+    Type: Number
+    Default: 1
+  MaxCapacity:
+    Type: Number
+    Default: 4
+  CpuTargetPercent:
+    Type: Number
+    Default: 60
+    MinValue: 20
+    MaxValue: 90
+    Description: Average CPU the scaling policy holds the service at.
+  HealthCheckPath:
+    Type: String
+    Default: /actuator/health
+  LogRetentionDays:
+    Type: Number
+    Default: 30
+    AllowedValues: [1, 3, 7, 14, 30, 60, 90]
+  MaxUploadMb:
+    Type: Number
+    Default: 10
+
+  # --- pipeline ---------------------------------------------------------------
+  DeployArtifactKey:
+    Type: String
+    Default: deploy/photo-gallery-deploy.zip
+    Description: Must match ARTIFACT_KEY in the application workflow.
+  TriggerImageTag:
+    Type: String
+    Default: latest
+    Description: >
+      Only a push of this tag starts a deployment. The workflow pushes the
+      immutable :sha tag first and :latest last, so the deploy bundle is always
+      in place before the trigger fires.
+  DeploymentConfigName:
+    Type: String
+    Default: CodeDeployDefault.ECSAllAtOnce
+    AllowedValues:
+      - CodeDeployDefault.ECSAllAtOnce
+      - CodeDeployDefault.ECSLinear10PercentEvery1Minutes
+      - CodeDeployDefault.ECSLinear10PercentEvery3Minutes
+      - CodeDeployDefault.ECSCanary10Percent5Minutes
+      - CodeDeployDefault.ECSCanary10Percent15Minutes
+  BlueTerminationWaitMinutes:
+    Type: Number
+    Default: 5
+    Description: How long the old task set is kept alive for instant rollback.
+
+Conditions:
+  ShouldCreateOidcProvider: !Equals [!Ref CreateOidcProvider, 'true']
+  UseImmutableSubject: !Not [!Equals [!Ref AppRepoSubjectPrefix, '']]
+  # Guards the eleven resources that cannot exist until an image is in ECR.
+  DeployRuntime: !Equals [!Ref DeployStage, full]
+
+Resources:
+
+  # ===========================================================================
+  # 1. CI identity and container registry
+  # ===========================================================================
+
+  # GitHub Actions -> AWS trust. No long-lived access keys exist anywhere in this
+  # project; GitHub presents a short-lived OIDC token and STS exchanges it.
+  GitHubOidcProvider:
+    Type: AWS::IAM::OIDCProvider
+    Condition: ShouldCreateOidcProvider
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList:
+        - sts.amazonaws.com
+      ThumbprintList:
+        - 6938fd4d98bab03faadb97b34396831e3780aea1
+        - 1c58a3a8518e8759bf075b76b750d4f2df264fcd
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-github-oidc'
+
+  GitHubActionsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-github-actions'
+      Description: Assumed by GitHub Actions to build and publish container images.
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !If
+                - ShouldCreateOidcProvider
+                - !Ref GitHubOidcProvider
+                - !Ref ExistingOidcProviderArn
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+              StringLike:
+                # Scoped to one repository AND one branch. Widen deliberately, never with '*'.
+                # Exactly one form is allowed - whichever GitHub actually issues.
+                # Permitting both would defeat the point of the immutable claim,
+                # since the classic form would still match a repository that later
+                # took over this one's name.
+                token.actions.githubusercontent.com:sub: !If
+                  - UseImmutableSubject
+                  - !Sub '${AppRepoSubjectPrefix}:ref:refs/heads/${AppRepoBranch}'
+                  - !Sub 'repo:${GitHubOrg}/${AppRepoName}:ref:refs/heads/${AppRepoBranch}'
+      Policies:
+        - PolicyName: ecr-push
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: EcrAuthToken
+                Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: '*'
+              - Sid: EcrPushToProjectRepoOnly
+                Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:CompleteLayerUpload
+                  - ecr:InitiateLayerUpload
+                  - ecr:PutImage
+                  - ecr:UploadLayerPart
+                  - ecr:BatchGetImage
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:DescribeImages
+                Resource: !GetAtt EcrRepository.Arn
+        - PolicyName: publish-deploy-artifact
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: ReadCurrentTaskDefinition
+                Effect: Allow
+                Action: ecs:DescribeTaskDefinition
+                Resource: '*'   # This API does not support resource-level permissions.
+              - Sid: UploadDeployBundle
+                Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                Resource: !Sub '${ArtifactBucket.Arn}/deploy/*'
+
+  EcrRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Ref ProjectName
+      ImageTagMutability: MUTABLE      # the 'latest' tag is reused as the deploy trigger
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      EncryptionConfiguration:
+        EncryptionType: AES256
+      EmptyOnDelete: true
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Keep the 10 most recent images, expire the rest",
+                "selection": {
+                  "tagStatus": "any",
+                  "countType": "imageCountMoreThan",
+                  "countNumber": 10
+                },
+                "action": { "type": "expire" }
+              }
+            ]
+          }
+
+  # CodePipeline artifact store. Also holds the deploy bundle (taskdef + appspec)
+  # that GitHub Actions publishes.
+  ArtifactBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      BucketName: !Sub '${ProjectName}-artifacts-${AWS::AccountId}-${AWS::Region}'
+      VersioningConfiguration:
+        Status: Enabled               # required by the CodePipeline S3 source action
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-old-artifact-versions
+            Status: Enabled
+            NoncurrentVersionExpirationInDays: 30
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+
+  ArtifactBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ArtifactBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource:
+              - !GetAtt ArtifactBucket.Arn
+              - !Sub '${ArtifactBucket.Arn}/*'
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+
+  # ===========================================================================
+  # 2. Network - two AZs, three tiers, and deliberately NO NAT gateway.
+  #    Private tasks reach ECR, S3, CloudWatch Logs and Secrets Manager over VPC
+  #    endpoints, which is cheaper and removes any egress path to the internet.
+  # ===========================================================================
+
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true        # required for private DNS on interface endpoints
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-vpc'
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-igw'
+
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  # Fn::Cidr carves the /16 into six /24s so the CIDR maths is derived, not
+  # hand-typed: 0=public-a 1=public-b 2=app-a 3=app-b 4=data-a 5=data-b
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: !Select [0, !Cidr [!Ref VpcCidr, 6, 8]]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-public-a'
+        - Key: Tier
+          Value: public
+
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: !Select [1, !Cidr [!Ref VpcCidr, 6, 8]]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-public-b'
+        - Key: Tier
+          Value: public
+
+  PrivateAppSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: !Select [2, !Cidr [!Ref VpcCidr, 6, 8]]
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-app-a'
+        - Key: Tier
+          Value: private-app
+
+  PrivateAppSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: !Select [3, !Cidr [!Ref VpcCidr, 6, 8]]
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-app-b'
+        - Key: Tier
+          Value: private-app
+
+  PrivateDataSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: !Select [4, !Cidr [!Ref VpcCidr, 6, 8]]
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-data-a'
+        - Key: Tier
+          Value: private-data
+
+  PrivateDataSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: !Select [5, !Cidr [!Ref VpcCidr, 6, 8]]
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-data-b'
+        - Key: Tier
+          Value: private-data
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-rtb-public'
+
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetARouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetA
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnetBRouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetB
+      RouteTableId: !Ref PublicRouteTable
+
+  # One private route table is enough: with no NAT gateway there are no
+  # AZ-specific routes to keep apart.
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-rtb-private'
+
+  PrivateAppSubnetARouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateAppSubnetA
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateAppSubnetBRouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateAppSubnetB
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateDataSubnetARouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateDataSubnetA
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateDataSubnetBRouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateDataSubnetB
+      RouteTableId: !Ref PrivateRouteTable
+
+  # Security group rules are declared as separate resources so the ALB and ECS
+  # groups can reference each other without a circular dependency.
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${ProjectName}-alb-sg'
+      GroupDescription: Public entry point. Accepts HTTP from the internet.
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: Production traffic
+        - IpProtocol: tcp
+          FromPort: !Ref TestListenerPort
+          ToPort: !Ref TestListenerPort
+          CidrIp: !Ref TestListenerCidr
+          Description: CodeDeploy test listener (green environment)
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-alb-sg'
+
+  EcsSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${ProjectName}-ecs-sg'
+      GroupDescription: Fargate tasks. Only the ALB may reach them.
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-ecs-sg'
+
+  RdsSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${ProjectName}-rds-sg'
+      GroupDescription: PostgreSQL. Only ECS tasks may reach it.
+      VpcId: !Ref Vpc
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: 127.0.0.1/32
+          Description: No egress required
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-rds-sg'
+
+  VpcEndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${ProjectName}-vpce-sg'
+      GroupDescription: Interface VPC endpoints. HTTPS from the application tier.
+      VpcId: !Ref Vpc
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: 127.0.0.1/32
+          Description: No egress required
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-vpce-sg'
+
+  AlbToEcsEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref AlbSecurityGroup
+      IpProtocol: tcp
+      FromPort: !Ref ContainerPort
+      ToPort: !Ref ContainerPort
+      DestinationSecurityGroupId: !Ref EcsSecurityGroup
+      Description: Forward to Fargate tasks
+
+  EcsFromAlbIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref EcsSecurityGroup
+      IpProtocol: tcp
+      FromPort: !Ref ContainerPort
+      ToPort: !Ref ContainerPort
+      SourceSecurityGroupId: !Ref AlbSecurityGroup
+      Description: Traffic and health checks from the ALB
+
+  EcsToDatabaseEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref EcsSecurityGroup
+      IpProtocol: tcp
+      FromPort: 5432
+      ToPort: 5432
+      DestinationSecurityGroupId: !Ref RdsSecurityGroup
+      Description: PostgreSQL
+
+  # 443 to 0.0.0.0/0 looks broad but is not: the private route table has no
+  # internet route, so the only reachable HTTPS destinations are the VPC
+  # endpoints and the S3 gateway endpoint prefix list.
+  EcsHttpsEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref EcsSecurityGroup
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      CidrIp: 0.0.0.0/0
+      Description: AWS APIs via VPC endpoints only (no internet route exists)
+
+  DatabaseFromEcsIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref RdsSecurityGroup
+      IpProtocol: tcp
+      FromPort: 5432
+      ToPort: 5432
+      SourceSecurityGroupId: !Ref EcsSecurityGroup
+      Description: PostgreSQL from the application tier only
+
+  VpcEndpointFromEcsIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref VpcEndpointSecurityGroup
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      SourceSecurityGroupId: !Ref EcsSecurityGroup
+      Description: HTTPS from the application tier
+
+  # The reason no NAT gateway is needed.
+  S3GatewayEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.s3'
+      VpcEndpointType: Gateway
+      RouteTableIds:
+        - !Ref PrivateRouteTable
+      # Used for image uploads AND for pulling ECR layers, which are stored in S3.
+
+  EcrApiEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ecr.api'
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref PrivateAppSubnetA
+        - !Ref PrivateAppSubnetB
+      SecurityGroupIds:
+        - !Ref VpcEndpointSecurityGroup
+
+  EcrDkrEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ecr.dkr'
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref PrivateAppSubnetA
+        - !Ref PrivateAppSubnetB
+      SecurityGroupIds:
+        - !Ref VpcEndpointSecurityGroup
+
+  CloudWatchLogsEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.logs'
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref PrivateAppSubnetA
+        - !Ref PrivateAppSubnetB
+      SecurityGroupIds:
+        - !Ref VpcEndpointSecurityGroup
+
+  # The ECS agent injects the database secret through the task ENI, so this
+  # endpoint is what makes secret injection work without a NAT gateway.
+  SecretsManagerEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.secretsmanager'
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref PrivateAppSubnetA
+        - !Ref PrivateAppSubnetB
+      SecurityGroupIds:
+        - !Ref VpcEndpointSecurityGroup
+
+  # ===========================================================================
+  # 3. Image storage and delivery. The bucket has no public path at all: only
+  #    CloudFront can read it, via OAC and a policy conditioned on this
+  #    distribution's ARN.
+  # ===========================================================================
+
+  ImageBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub '${ProjectName}-images-${AWS::AccountId}-${AWS::Region}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced   # ACLs disabled entirely
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: tidy-up
+            Status: Enabled
+            NoncurrentVersionExpirationInDays: 30
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-images'
+
+  # Origin Access Control (the successor to OAI - SigV4, supports SSE-KMS and
+  # all HTTP methods).
+  ImageOriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub '${ProjectName}-images-oac'
+        Description: Lets only this distribution read the private image bucket.
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  ImageDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Comment: !Sub '${ProjectName} image delivery'
+        Enabled: true
+        PriceClass: PriceClass_200
+        HttpVersion: http2and3
+        IPV6Enabled: true
+        Origins:
+          - Id: s3-images
+            DomainName: !GetAtt ImageBucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt ImageOriginAccessControl.Id
+            S3OriginConfig:
+              OriginAccessIdentity: ''    # must be empty when using OAC
+            ConnectionAttempts: 3
+            ConnectionTimeout: 10
+        DefaultCacheBehavior:
+          TargetOriginId: s3-images
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD]
+          CachedMethods: [GET, HEAD]
+          Compress: true
+          # Managed policies: CachingOptimized + CORS-With-Preflight&SecurityHeaders
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+          ResponseHeadersPolicyId: eaab4381-ed33-4a86-88ca-d9558dc6cd63
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-cdn'
+
+  ImageBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ImageBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowCloudFrontServicePrincipalReadOnly
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub '${ImageBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub 'arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${ImageDistribution.Id}'
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource:
+              - !GetAtt ImageBucket.Arn
+              - !Sub '${ImageBucket.Arn}/*'
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+
+  # ===========================================================================
+  # 4. Database. ManageMasterUserPassword means no credential exists in this
+  #    template, in Git, or in the console - RDS generates and rotates it in
+  #    Secrets Manager and ECS injects it at task start.
+  # ===========================================================================
+
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupName: !Sub '${ProjectName}-db-subnets'
+      DBSubnetGroupDescription: Private data-tier subnets across two AZs.
+      SubnetIds:
+        - !Ref PrivateDataSubnetA
+        - !Ref PrivateDataSubnetB
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-db-subnets'
+
+  DBParameterGroup:
+    Type: AWS::RDS::DBParameterGroup
+    Properties:
+      Description: !Sub '${ProjectName} PostgreSQL parameters'
+      Family: !Sub 'postgres${DBEngineVersion}'
+      Parameters:
+        log_min_duration_statement: '2000'   # log statements slower than 2s
+        log_connections: '1'
+        log_disconnections: '1'
+
+  Database:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Delete            # switch to Snapshot for anything real
+    UpdateReplacePolicy: Snapshot
+    Properties:
+      DBInstanceIdentifier: !Sub '${ProjectName}-postgres'
+      Engine: postgres
+      EngineVersion: !Ref DBEngineVersion
+      DBInstanceClass: !Ref DBInstanceClass
+      DBName: !Ref DBName
+      MasterUsername: !Ref DBMasterUsername
+      ManageMasterUserPassword: true  # RDS generates + stores + rotates the password
+      MultiAZ: !Ref MultiAZ
+      AllocatedStorage: !Ref DBAllocatedStorage
+      StorageType: gp3
+      StorageEncrypted: true
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      DBParameterGroupName: !Ref DBParameterGroup
+      VPCSecurityGroups:
+        - !Ref RdsSecurityGroup
+      PubliclyAccessible: false
+      BackupRetentionPeriod: !Ref BackupRetentionDays
+      PreferredBackupWindow: '02:00-03:00'
+      PreferredMaintenanceWindow: 'sun:03:30-sun:04:30'
+      AutoMinorVersionUpgrade: true
+      CopyTagsToSnapshot: true
+      DeletionProtection: false       # true for anything real
+      EnableCloudwatchLogsExports:
+        - postgresql
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-postgres'
+
+  # ===========================================================================
+  # 5. Compute. Everything here except the Service and its scaling exists in
+  #    both stages - the ALB, target groups, listeners, cluster, roles and task
+  #    definition are all safe to create before any image is in ECR.
+  # ===========================================================================
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    Properties:
+      LogGroupName: !Sub '/ecs/${ProjectName}'
+      RetentionInDays: !Ref LogRetentionDays
+
+  # Two roles with different jobs: the execution role is used by the ECS agent
+  # (pull image, fetch secret, write logs); the task role is used by the
+  # application itself (write to S3, nothing more).
+  TaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-task-execution'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: read-database-secret
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !GetAtt Database.MasterUserSecret.SecretArn
+              - Effect: Allow
+                Action: kms:Decrypt
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    kms:ViaService: !Sub 'secretsmanager.${AWS::Region}.amazonaws.com'
+
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-task'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: write-images-only
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Write-only, and only under the photos/ prefix. The app never needs
+              # to read objects back - CloudFront serves them.
+              - Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub '${ImageBucket.Arn}/photos/*'
+
+  # Production listener (:80) plus a test listener used by CodeDeploy to
+  # validate the green task set before shifting traffic.
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub '${ProjectName}-alb'
+      Type: application
+      Scheme: internet-facing
+      IpAddressType: ipv4
+      Subnets:
+        - !Ref PublicSubnetA
+        - !Ref PublicSubnetB
+      SecurityGroups:
+        - !Ref AlbSecurityGroup
+      LoadBalancerAttributes:
+        - Key: idle_timeout.timeout_seconds
+          Value: '60'
+        - Key: routing.http.drop_invalid_header_fields.enabled
+          Value: 'true'
+        - Key: deletion_protection.enabled
+          Value: 'false'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-alb'
+
+  TargetGroupBlue:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${ProjectName}-tg-blue'
+      VpcId: !Ref Vpc
+      TargetType: ip                 # required for awsvpc / Fargate
+      Protocol: HTTP
+      Port: !Ref ContainerPort
+      HealthCheckEnabled: true
+      HealthCheckProtocol: HTTP
+      HealthCheckPath: !Ref HealthCheckPath
+      HealthCheckIntervalSeconds: 15
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher:
+        HttpCode: '200'
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: '30'
+
+  TargetGroupGreen:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${ProjectName}-tg-green'
+      VpcId: !Ref Vpc
+      TargetType: ip
+      Protocol: HTTP
+      Port: !Ref ContainerPort
+      HealthCheckEnabled: true
+      HealthCheckProtocol: HTTP
+      HealthCheckPath: !Ref HealthCheckPath
+      HealthCheckIntervalSeconds: 15
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher:
+        HttpCode: '200'
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: '30'
+
+  ProductionListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroupBlue
+
+  TestListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: !Ref TestListenerPort
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroupGreen
+
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub '${ProjectName}-cluster'
+      ClusterSettings:
+        - Name: containerInsights
+          Value: enabled
+      Configuration:
+        ExecuteCommandConfiguration:
+          Logging: DEFAULT
+
+  # Registering a revision whose image does not exist yet is fine - ECS does not
+  # resolve the image until a task launches. That is what lets the whole runtime
+  # environment come up in stage 'foundation', with only the Service held back.
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    # Retain, not replace-and-deregister. CodeDeploy's live task set points at a
+    # specific revision; if CloudFormation deregistered it, scaling out would fail
+    # because ECS cannot launch tasks from an INACTIVE revision.
+    UpdateReplacePolicy: Retain
+    DeletionPolicy: Retain
+    Properties:
+      Family: !Ref ProjectName
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      Cpu: !Ref TaskCpu
+      Memory: !Ref TaskMemory
+      RuntimePlatform:
+        OperatingSystemFamily: LINUX
+        CpuArchitecture: X86_64
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      ContainerDefinitions:
+        - Name: !Ref ProjectName
+          Image: !Sub
+            - '${RepoUri}:${ImageTag}'
+            - RepoUri: !GetAtt EcrRepository.RepositoryUri
+          Essential: true
+          PortMappings:
+            - Name: http
+              ContainerPort: !Ref ContainerPort
+              Protocol: tcp
+              AppProtocol: http
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: app
+          Environment:
+            - Name: SPRING_PROFILES_ACTIVE
+              Value: prod
+            - Name: SERVER_PORT
+              Value: !Ref ContainerPort
+            - Name: DB_HOST
+              Value: !GetAtt Database.Endpoint.Address
+            - Name: DB_PORT
+              Value: !GetAtt Database.Endpoint.Port
+            - Name: DB_NAME
+              Value: !Ref DBName
+            - Name: S3_BUCKET
+              Value: !Ref ImageBucket
+            - Name: CLOUDFRONT_DOMAIN
+              Value: !GetAtt ImageDistribution.DomainName
+            - Name: AWS_REGION
+              Value: !Ref AWS::Region
+            - Name: MAX_UPLOAD_MB
+              Value: !Ref MaxUploadMb
+          Secrets:
+            # Resolved by the ECS agent at task start over the Secrets Manager
+            # VPC endpoint. The values never appear in the task definition.
+            - Name: DB_USERNAME
+              ValueFrom: !Sub
+                - '${SecretArn}:username::'
+                - SecretArn: !GetAtt Database.MasterUserSecret.SecretArn
+            - Name: DB_PASSWORD
+              ValueFrom: !Sub
+                - '${SecretArn}:password::'
+                - SecretArn: !GetAtt Database.MasterUserSecret.SecretArn
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-task'
+
+  Service:
+    Type: AWS::ECS::Service
+    Condition: DeployRuntime
+    DependsOn:
+      - ProductionListener
+      - TestListener
+      - TaskDefinition
+    Properties:
+      ServiceName: !Sub '${ProjectName}-service'
+      Cluster: !Ref Cluster
+      # Family name, NOT !Ref TaskDefinition. ECS resolves a bare family to its
+      # latest ACTIVE revision, so this property stays constant when the task
+      # definition changes. That matters because CloudFormation always includes
+      # taskDefinition in its UpdateService call, and ECS rejects that call for
+      # CODE_DEPLOY services ("Unable to update task definition on services with
+      # a CODE_DEPLOY deployment controller"). Keeping the value static means
+      # editing the task definition never provokes a service update at all.
+      TaskDefinition: !Ref ProjectName
+      DesiredCount: !Ref DesiredCount
+      LaunchType: FARGATE
+      PlatformVersion: LATEST
+      DeploymentController:
+        Type: CODE_DEPLOY          # hands the rollout over to CodeDeploy
+      HealthCheckGracePeriodSeconds: 120
+      PropagateTags: SERVICE
+      EnableECSManagedTags: true
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED  # tasks have no public IP at all
+          Subnets:
+            - !Ref PrivateAppSubnetA
+            - !Ref PrivateAppSubnetB
+          SecurityGroups:
+            - !Ref EcsSecurityGroup
+      LoadBalancers:
+        - ContainerName: !Ref ProjectName
+          ContainerPort: !Ref ContainerPort
+          TargetGroupArn: !Ref TargetGroupBlue
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-service'
+
+  ScalableTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Condition: DeployRuntime
+    Properties:
+      ServiceNamespace: ecs
+      ScalableDimension: ecs:service:DesiredCount
+      ResourceId: !Sub 'service/${Cluster}/${Service.Name}'
+      MinCapacity: !Ref MinCapacity
+      MaxCapacity: !Ref MaxCapacity
+
+  CpuScalingPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Condition: DeployRuntime
+    Properties:
+      PolicyName: !Sub '${ProjectName}-cpu-target-tracking'
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref ScalableTarget
+      TargetTrackingScalingPolicyConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ECSServiceAverageCPUUtilization
+        TargetValue: !Ref CpuTargetPercent
+        ScaleOutCooldown: 60        # react quickly to load
+        ScaleInCooldown: 300        # shrink slowly to avoid flapping
+        DisableScaleIn: false
+
+  # ===========================================================================
+  # 6. Deployment pipeline. All conditional: every resource here references the
+  #    Service, which only exists in stage 'full'.
+  #
+  #    Flow: GitHub Actions pushes image:<sha>, uploads the deploy bundle to S3,
+  #    then pushes image:latest -> EventBridge rule fires -> CodePipeline starts
+  #    -> S3 source stage supplies taskdef.json + appspec.yaml -> CodeDeploy
+  #    registers a new task definition revision, launches the green task set,
+  #    health-checks it on the test listener, shifts the production listener,
+  #    then drains blue.
+  # ===========================================================================
+
+  # Wired into the deployment group so a spike of 5xx during the traffic shift
+  # rolls the deployment back automatically.
+  Alb5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: DeployRuntime
+    Properties:
+      AlarmName: !Sub '${ProjectName}-alb-5xx'
+      AlarmDescription: Target 5xx responses observed through the ALB.
+      Namespace: AWS/ApplicationELB
+      MetricName: HTTPCode_Target_5XX_Count
+      Dimensions:
+        - Name: LoadBalancer
+          Value: !GetAtt LoadBalancer.LoadBalancerFullName
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+  CodeDeployServiceRole:
+    Type: AWS::IAM::Role
+    Condition: DeployRuntime
+    Properties:
+      RoleName: !Sub '${ProjectName}-codedeploy'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codedeploy.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AWSCodeDeployRoleForECS
+
+  CodeDeployApplication:
+    Type: AWS::CodeDeploy::Application
+    Condition: DeployRuntime
+    Properties:
+      ApplicationName: !Sub '${ProjectName}-app'
+      ComputePlatform: ECS
+
+  DeploymentGroup:
+    Type: AWS::CodeDeploy::DeploymentGroup
+    Condition: DeployRuntime
+    Properties:
+      ApplicationName: !Ref CodeDeployApplication
+      DeploymentGroupName: !Sub '${ProjectName}-dg'
+      ServiceRoleArn: !GetAtt CodeDeployServiceRole.Arn
+      DeploymentConfigName: !Ref DeploymentConfigName
+      DeploymentStyle:
+        DeploymentType: BLUE_GREEN
+        DeploymentOption: WITH_TRAFFIC_CONTROL
+      ECSServices:
+        - ClusterName: !Ref Cluster
+          ServiceName: !GetAtt Service.Name
+      BlueGreenDeploymentConfiguration:
+        DeploymentReadyOption:
+          ActionOnTimeout: CONTINUE_DEPLOYMENT   # shift traffic as soon as green is healthy
+        TerminateBlueInstancesOnDeploymentSuccess:
+          Action: TERMINATE
+          TerminationWaitTimeInMinutes: !Ref BlueTerminationWaitMinutes
+      LoadBalancerInfo:
+        TargetGroupPairInfoList:
+          - ProdTrafficRoute:
+              ListenerArns:
+                - !Ref ProductionListener
+            TestTrafficRoute:
+              ListenerArns:
+                - !Ref TestListener
+            TargetGroups:
+              - Name: !GetAtt TargetGroupBlue.TargetGroupName
+              - Name: !GetAtt TargetGroupGreen.TargetGroupName
+      AutoRollbackConfiguration:
+        Enabled: true
+        Events:
+          - DEPLOYMENT_FAILURE
+          - DEPLOYMENT_STOP_ON_ALARM
+      AlarmConfiguration:
+        Enabled: true
+        Alarms:
+          - Name: !Ref Alb5xxAlarm
+
+  PipelineRole:
+    Type: AWS::IAM::Role
+    Condition: DeployRuntime
+    Properties:
+      RoleName: !Sub '${ProjectName}-codepipeline'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codepipeline.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: pipeline-permissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: ArtifactStoreAccess
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:PutObject
+                  - s3:GetBucketVersioning
+                  - s3:GetBucketLocation
+                Resource:
+                  - !GetAtt ArtifactBucket.Arn
+                  - !Sub '${ArtifactBucket.Arn}/*'
+              - Sid: DriveCodeDeploy
+                Effect: Allow
+                Action:
+                  - codedeploy:CreateDeployment
+                  - codedeploy:GetDeployment
+                  - codedeploy:GetDeploymentConfig
+                  - codedeploy:GetApplication
+                  - codedeploy:GetApplicationRevision
+                  - codedeploy:RegisterApplicationRevision
+                  - codedeploy:ContinueDeployment
+                Resource: '*'
+              - Sid: RegisterTaskDefinition
+                Effect: Allow
+                Action:
+                  - ecs:RegisterTaskDefinition
+                  - ecs:DescribeServices
+                  - ecs:DescribeTaskDefinition
+                Resource: '*'   # these APIs have no resource-level support
+              - Sid: PassTaskRolesToEcsOnly
+                Effect: Allow
+                Action: iam:PassRole
+                Resource:
+                  - !GetAtt TaskRole.Arn
+                  - !GetAtt TaskExecutionRole.Arn
+                Condition:
+                  StringEquals:
+                    iam:PassedToService: ecs-tasks.amazonaws.com
+
+  Pipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Condition: DeployRuntime
+    Properties:
+      Name: !Sub '${ProjectName}-pipeline'
+      PipelineType: V1
+      RoleArn: !GetAtt PipelineRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: !Ref ArtifactBucket
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: DeployBundle
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: S3
+                Version: '1'
+              Configuration:
+                S3Bucket: !Ref ArtifactBucket
+                S3ObjectKey: !Ref DeployArtifactKey
+                PollForSourceChanges: 'false'   # EventBridge is the only trigger
+              OutputArtifacts:
+                - Name: DeployBundle
+              RunOrder: 1
+        - Name: Deploy
+          Actions:
+            - Name: BlueGreenToEcs
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CodeDeployToECS
+                Version: '1'
+              Configuration:
+                ApplicationName: !Ref CodeDeployApplication
+                DeploymentGroupName: !Ref DeploymentGroup
+                TaskDefinitionTemplateArtifact: DeployBundle
+                TaskDefinitionTemplatePath: taskdef.json
+                AppSpecTemplateArtifact: DeployBundle
+                AppSpecTemplatePath: appspec.yaml
+              InputArtifacts:
+                - Name: DeployBundle
+              RunOrder: 1
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-pipeline'
+
+  EventBridgeInvokePipelineRole:
+    Type: AWS::IAM::Role
+    Condition: DeployRuntime
+    Properties:
+      RoleName: !Sub '${ProjectName}-eventbridge-pipeline'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: start-pipeline
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: codepipeline:StartPipelineExecution
+                Resource: !Sub 'arn:${AWS::Partition}:codepipeline:${AWS::Region}:${AWS::AccountId}:${Pipeline}'
+
+  EcrImagePushRule:
+    Type: AWS::Events::Rule
+    Condition: DeployRuntime
+    Properties:
+      Name: !Sub '${ProjectName}-ecr-push-to-pipeline'
+      Description: Starts the deployment pipeline when a new application image is pushed.
+      State: ENABLED
+      EventPattern:
+        source:
+          - aws.ecr
+        detail-type:
+          - ECR Image Action        # native ECR event, no CloudTrail needed
+        detail:
+          action-type:
+            - PUSH
+          result:
+            - SUCCESS
+          repository-name:
+            - !Ref EcrRepository
+          image-tag:
+            - !Ref TriggerImageTag
+      Targets:
+        - Id: codepipeline
+          Arn: !Sub 'arn:${AWS::Partition}:codepipeline:${AWS::Region}:${AWS::AccountId}:${Pipeline}'
+          RoleArn: !GetAtt EventBridgeInvokePipelineRole.Arn
+
+# =============================================================================
+# Everything a human or a script needs, on one stack.
+# =============================================================================
+Outputs:
+
+  GitHubActionsRoleArn:
+    Description: Put this in the APP repo as the AWS_ROLE_ARN variable.
+    Value: !GetAtt GitHubActionsRole.Arn
+  ArtifactBucketName:
+    Description: Put this in the APP repo as the ARTIFACT_BUCKET variable.
+    Value: !Ref ArtifactBucket
+  EcrRepositoryUri:
+    Value: !GetAtt EcrRepository.RepositoryUri
+
+  VpcId:
+    Value: !Ref Vpc
+
+  ImageBucketName:
+    Value: !Ref ImageBucket
+  CloudFrontDomainName:
+    Description: Injected into the container as CLOUDFRONT_DOMAIN.
+    Value: !GetAtt ImageDistribution.DomainName
+  CloudFrontDistributionId:
+    Value: !GetAtt ImageDistribution.Id
+
+  DatabaseEndpoint:
+    Value: !GetAtt Database.Endpoint.Address
+  DatabaseSecretArn:
+    Description: RDS-managed secret holding username and password keys.
+    Value: !GetAtt Database.MasterUserSecret.SecretArn
+
+  AlbDnsName:
+    Description: The application endpoint. This is the submission URL.
+    Value: !Sub 'http://${LoadBalancer.DNSName}'
+  ClusterName:
+    Value: !Ref Cluster
+  TaskDefinitionFamily:
+    Value: !Ref ProjectName
+  LogGroupName:
+    Value: !Ref LogGroup
+
+  ServiceName:
+    Condition: DeployRuntime
+    Value: !GetAtt Service.Name
+  PipelineName:
+    Condition: DeployRuntime
+    Value: !Ref Pipeline
+  CodeDeployApplicationName:
+    Condition: DeployRuntime
+    Value: !Ref CodeDeployApplication
+  DeploymentGroupName:
+    Condition: DeployRuntime
+    Value: !Ref DeploymentGroup
+  EventRuleName:
+    Condition: DeployRuntime
+    Value: !Ref EcrImagePushRule

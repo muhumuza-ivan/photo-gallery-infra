@@ -1,0 +1,32 @@
+name: Lint template
+
+# The only CI this repository has, and it deploys nothing. Git sync deploys
+# template.yaml directly from main, so this exists purely to catch a broken
+# template in a pull request rather than in a change set.
+#
+# No AWS credentials, no OIDC, no permissions beyond reading the code.
+on:
+  pull_request:
+    paths:
+      - 'template.yaml'
+      - '.cfn-deployments/**'
+      - '.github/workflows/lint.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'template.yaml'
+      - '.cfn-deployments/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: cfn-lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - run: pip install --quiet cfn-lint
+      - run: cfn-lint -- template.yaml
