@@ -13,7 +13,7 @@ parameters:
   #               pipeline. Use it for the first deployment.
   # full       -> adds them. Switch only after the application repository has
   #               pushed its first image to ECR.
-  DeployStage: foundation
+  DeployStage: full
 
   GitHubOrg: muhumuza-ivan
   AppRepoName: photo-gallery-app
