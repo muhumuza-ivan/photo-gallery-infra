@@ -1,10 +1,3 @@
-# CloudFormation Git sync deployment file.
-#
-# One file, one stack, one template read straight from this repository. Edit a
-# value here or in template.yaml, push to main, and CloudFormation creates and
-# executes a change set. Nothing else is in the loop.
-#
-# These tags are applied to the stack and every resource in it.
 template-file-path: template.yaml
 parameters:
   ProjectName: photo-gallery
@@ -13,40 +6,14 @@ parameters:
   #               pipeline. Use it for the first deployment.
   # full       -> adds them. Switch only after the application repository has
   #               pushed its first image to ECR.
-  # Start a fresh account at 'foundation'. The ECS service cannot reach a steady
-  # state until an image exists in ECR, and this stack creates the ECR repository
-  # and the role that pushes to it. Switch to 'full' after the first image lands.
   DeployStage: foundation
 
   GitHubOrg: muhumuza-ivan
   AppRepoName: photo-gallery-app
   AppRepoBranch: main
-
-  # An IAM OIDC provider is account-scoped and only one may exist per URL, so this
-  # is account-specific and MUST be checked when rebuilding in a new account:
-  #
-  #   aws iam list-open-id-connect-providers \
-  #     --query "OpenIDConnectProviderList[?contains(Arn,'token.actions.githubusercontent.com')].Arn" \
-  #     --output text
-  #
-  # Empty result -> leave CreateOidcProvider 'true' and the ARN empty.
-  # An ARN       -> set CreateOidcProvider 'false' and paste that ARN below,
-  #                 otherwise the stack fails with AlreadyExists on the provider.
-  CreateOidcProvider: 'true'
-  ExistingOidcProviderArn: ''
-
-  # This GitHub account issues immutable subject claims - the owner and repository
-  # IDs are embedded, so the classic repo:owner/name form would never match and the
-  # app workflow could not assume the role. The IDs are per-repository: this is
-  # photo-gallery-APP's prefix, not photo-gallery-infra's.
-  #
-  # Combined with AppRepoBranch, the trust policy pins the subject to exactly:
-  #   repo:muhumuza-ivan@211486075/photo-gallery-app@1358941347:ref:refs/heads/main
-  #
-  # Re-derive with:
-  #   gh api /repos/muhumuza-ivan/photo-gallery-app \
-  #     --jq '"repo:\(.owner.login)@\(.owner.id)/\(.name)@\(.id)"'
-  AppRepoSubjectPrefix: 'repo:muhumuza-ivan@211486075/photo-gallery-app@1358941347'
+  CreateOidcProvider: 'false'
+  GitHubOwnerId: '211486075'
+  AppRepoId: '1358941347'
 
   VpcCidr: 10.20.0.0/16
   ContainerPort: '8080'

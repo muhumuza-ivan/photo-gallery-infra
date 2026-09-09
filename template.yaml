@@ -43,31 +43,46 @@ Parameters:
     Type: String
     Default: main
     Description: Only this branch may assume the CI role.
-  AppRepoSubjectPrefix:
+  # --- GitHub numeric IDs, for accounts issuing immutable subject claims -------
+  # These two are the only values in this template that cannot be derived from
+  # AWS or from another parameter: they are facts about GitHub. Leave both empty
+  # for the classic repo:owner/name subject form.
+  #
+  #   classic     repo:my-org/photo-gallery-app:ref:refs/heads/main
+  #   immutable   repo:my-org@211486075/photo-gallery-app@1358941347:ref:refs/heads/main
+  #
+  # The subject FORMAT is assembled below rather than pasted in, so only the
+  # numbers live in the deployment file. Obtain them with:
+  #
+  #   gh api /repos/<org>/photo-gallery-app --jq '{owner:.owner.id, repo:.id}'
+  #
+  GitHubOwnerId:
     Type: String
     Default: ''
+    AllowedPattern: '^[0-9]*$'
+    Description: Numeric GitHub owner (user or org) ID. Empty for the classic subject form.
+  AppRepoId:
+    Type: String
+    Default: ''
+    AllowedPattern: '^[0-9]*$'
     Description: >
-      Leave empty unless GitHub issues immutable subject claims for your account,
-      in which case the numeric owner and repository IDs are embedded in the
-      subject and the classic repo:owner/name form will never match:
-
-        classic     repo:my-org/photo-gallery-app
-        immutable   repo:my-org@211486075/photo-gallery-app@1358946729
-
-      Paste the prefix GitHub shows for the APPLICATION repository - the IDs are
-      per-repository, so the infrastructure repo's prefix is the wrong one. Stop
-      before the ':ref:...' segment; the branch is appended from AppRepoBranch.
+      Numeric ID of the APPLICATION repository - per-repository, so the
+      infrastructure repo's ID is the wrong one. Empty for the classic form.
   CreateOidcProvider:
     Type: String
     Default: 'true'
     AllowedValues: ['true', 'false']
     Description: >
-      Set to false if token.actions.githubusercontent.com is already registered
-      as an IAM OIDC provider in this account.
-  ExistingOidcProviderArn:
-    Type: String
-    Default: ''
-    Description: Required only when CreateOidcProvider is false.
+      An IAM OIDC provider is account-scoped and only one may exist per URL, and
+      CloudFormation cannot ask whether one is already there - hence this switch.
+      Set it to 'false' if the account already has a provider for
+      token.actions.githubusercontent.com; the stack then references the existing
+      one. Its ARN is NOT a parameter: the issuer URL is a constant and the
+      account comes from AWS::AccountId, so it is derived rather than pasted.
+
+        aws iam list-open-id-connect-providers \
+          --query "OpenIDConnectProviderList[?contains(Arn,'githubusercontent')].Arn" \
+          --output text
 
   # --- network ----------------------------------------------------------------
   VpcCidr:
@@ -191,7 +206,10 @@ Parameters:
 
 Conditions:
   ShouldCreateOidcProvider: !Equals [!Ref CreateOidcProvider, 'true']
-  UseImmutableSubject: !Not [!Equals [!Ref AppRepoSubjectPrefix, '']]
+  # Both IDs are required together - half of an immutable subject is no subject.
+  UseImmutableSubject: !And
+    - !Not [!Equals [!Ref GitHubOwnerId, '']]
+    - !Not [!Equals [!Ref AppRepoId, '']]
   # Guards the eleven resources that cannot exist until an image is in ECR.
   DeployRuntime: !Equals [!Ref DeployStage, full]
 
@@ -228,10 +246,13 @@ Resources:
         Statement:
           - Effect: Allow
             Principal:
+              # Either the provider this stack just created, or the one already in
+              # the account - whose ARN is a function of the account and a fixed
+              # issuer URL, so there is nothing to hard-code.
               Federated: !If
                 - ShouldCreateOidcProvider
                 - !Ref GitHubOidcProvider
-                - !Ref ExistingOidcProviderArn
+                - !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com'
             Action: sts:AssumeRoleWithWebIdentity
             Condition:
               StringEquals:
@@ -244,7 +265,7 @@ Resources:
                 # took over this one's name.
                 token.actions.githubusercontent.com:sub: !If
                   - UseImmutableSubject
-                  - !Sub '${AppRepoSubjectPrefix}:ref:refs/heads/${AppRepoBranch}'
+                  - !Sub 'repo:${GitHubOrg}@${GitHubOwnerId}/${AppRepoName}@${AppRepoId}:ref:refs/heads/${AppRepoBranch}'
                   - !Sub 'repo:${GitHubOrg}/${AppRepoName}:ref:refs/heads/${AppRepoBranch}'
       Policies:
         - PolicyName: ecr-push
