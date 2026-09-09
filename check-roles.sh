@@ -139,11 +139,14 @@ if role_header "${PROJECT}-github-actions" "assumed by the app repo via OIDC"; t
   check "${PROJECT}-github-actions" allow ecr:GetAuthorizationToken   '*'
   check "${PROJECT}-github-actions" allow ecr:InitiateLayerUpload     "$ECR_ARN"
   check "${PROJECT}-github-actions" allow ecr:PutImage                "$ECR_ARN"
-  check "${PROJECT}-github-actions" allow ecs:DescribeTaskDefinition  '*'
+  check "${PROJECT}-github-actions" allow cloudformation:DescribeStacks \
+        "arn:${PARTITION}:cloudformation:${REGION}:${ACCOUNT}:stack/${STACK}/*"
   check "${PROJECT}-github-actions" allow s3:PutObject                "arn:${PARTITION}:s3:::${ARTIFACT_BUCKET}/deploy/bundle.zip"
   # it builds and stages; it must not be able to deploy or read user photos
   check "${PROJECT}-github-actions" deny  ecr:DeleteRepository        "$ECR_ARN"
   check "${PROJECT}-github-actions" deny  ecs:UpdateService           '*'
+  check "${PROJECT}-github-actions" deny  cloudformation:UpdateStack \
+        "arn:${PARTITION}:cloudformation:${REGION}:${ACCOUNT}:stack/${STACK}/*"
   check "${PROJECT}-github-actions" deny  codepipeline:StartPipelineExecution "$PIPELINE_ARN"
   check "${PROJECT}-github-actions" deny  s3:GetObject                "arn:${PARTITION}:s3:::${IMAGE_BUCKET}/photos/x.jpg"
   check "${PROJECT}-github-actions" deny  s3:PutObject                "arn:${PARTITION}:s3:::${ARTIFACT_BUCKET}/elsewhere/x"

@@ -43,19 +43,6 @@ Parameters:
     Type: String
     Default: main
     Description: Only this branch may assume the CI role.
-  # --- GitHub numeric IDs, for accounts issuing immutable subject claims -------
-  # These two are the only values in this template that cannot be derived from
-  # AWS or from another parameter: they are facts about GitHub. Leave both empty
-  # for the classic repo:owner/name subject form.
-  #
-  #   classic     repo:my-org/photo-gallery-app:ref:refs/heads/main
-  #   immutable   repo:my-org@211486075/photo-gallery-app@1358941347:ref:refs/heads/main
-  #
-  # The subject FORMAT is assembled below rather than pasted in, so only the
-  # numbers live in the deployment file. Obtain them with:
-  #
-  #   gh api /repos/<org>/photo-gallery-app --jq '{owner:.owner.id, repo:.id}'
-  #
   GitHubOwnerId:
     Type: String
     Default: ''
@@ -292,10 +279,13 @@ Resources:
           PolicyDocument:
             Version: '2012-10-17'
             Statement:
-              - Sid: ReadCurrentTaskDefinition
+              # The workflow fills the placeholders in its committed
+              # taskdef.json from this stack's outputs. Reading them is all it
+              # needs - it cannot describe resources or change the stack.
+              - Sid: ReadThisStacksOutputs
                 Effect: Allow
-                Action: ecs:DescribeTaskDefinition
-                Resource: '*'   # This API does not support resource-level permissions.
+                Action: cloudformation:DescribeStacks
+                Resource: !Sub 'arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${ProjectName}/*'
               - Sid: UploadDeployBundle
                 Effect: Allow
                 Action:
