@@ -261,36 +261,32 @@ if role_header "${PROJECT}-git-sync" "assumed by CloudFormation Git sync"; then
         "arn:${PARTITION}:cloudformation:${REGION}:${ACCOUNT}:stack/some-other-stack/*"
 fi
 
-# The Git sync service principal is AWS-owned, so it is read from the account
-# rather than trusted from the template. AWS creates AWSServiceRoleForGitSync
-# alongside a Git sync setup; whatever principal that role trusts is the value
-# ours must match. Getting this wrong is silent - the role simply never gets
-# assumed and pushes stop deploying - so it is asserted, not just printed.
-echo
-echo "Git sync service principal"
-SLR_PRINCIPAL="$(aws iam get-role --role-name AWSServiceRoleForGitSync \
-  --query 'Role.AssumeRolePolicyDocument.Statement[0].Principal.Service' \
-  --output text 2>/dev/null)"
+# The value the sync configuration wizard demands. Confirmed empirically: it
+# rejects anything else outright. NOT cloudformation.amazonaws.com (that is the
+# execution role's principal) and NOT repository.sync.codeconnections... (that
+# is what the AWSServiceRoleForGitSync service-linked role trusts - a different
+# role for a different purpose).
+EXPECTED_SYNC_PRINCIPAL="cloudformation.sync.codeconnections.amazonaws.com"
 
-if [[ -z "$SLR_PRINCIPAL" || "$SLR_PRINCIPAL" == "None" ]]; then
-  skip=$((skip + 1))
-  printf '   %sSKIP%s  AWSServiceRoleForGitSync not present - nothing to compare against\n' "$Y" "$N"
-elif role_exists "${PROJECT}-git-sync"; then
+echo
+echo "Git sync trust principal"
+if role_exists "${PROJECT}-git-sync"; then
   OURS="$(aws iam get-role --role-name "${PROJECT}-git-sync" \
     --query 'Role.AssumeRolePolicyDocument.Statement[0].Principal.Service' --output text)"
-  if [[ "$OURS" == "$SLR_PRINCIPAL" ]]; then
+  if [[ "$OURS" == "$EXPECTED_SYNC_PRINCIPAL" ]]; then
     pass=$((pass + 1))
-    printf '   %sPASS%s  our role trusts %s\n' "$G" "$N" "$OURS"
+    printf '   %sPASS%s  %s-git-sync trusts %s\n' "$G" "$N" "$PROJECT" "$OURS"
   else
     fail=$((fail + 1))
-    printf '   %sFAIL%s  principal mismatch - the sync will never fire\n' "$R" "$N"
-    printf '         ours : %s\n' "$OURS"
-    printf '         AWS  : %s\n' "$SLR_PRINCIPAL"
-    printf '         fix  : redeploy prereq-roles.yaml with\n'
-    printf '                --parameter-overrides GitSyncServicePrincipal=%s\n' "$SLR_PRINCIPAL"
+    printf '   %sFAIL%s  wrong principal - the sync wizard will reject this role\n' "$R" "$N"
+    printf '         ours     : %s\n' "$OURS"
+    printf '         expected : %s\n' "$EXPECTED_SYNC_PRINCIPAL"
+    printf '         fix      : redeploy prereq-roles.yaml with\n'
+    printf '                    --parameter-overrides GitSyncServicePrincipal=%s\n' "$EXPECTED_SYNC_PRINCIPAL"
   fi
 else
-  printf '   %snote%s  AWS uses %s\n' "$D" "$N" "$SLR_PRINCIPAL"
+  skip=$((skip + 1))
+  printf '   %sSKIP%s  %s-git-sync not created yet\n' "$Y" "$N" "$PROJECT"
 fi
 
 # ------------------------------------------------------------------ summary --

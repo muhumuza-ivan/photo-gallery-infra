@@ -39,16 +39,22 @@ Parameters:
 
   GitSyncServicePrincipal:
     Type: String
-    Default: repository.sync.codeconnections.amazonaws.com
+    Default: cloudformation.sync.codeconnections.amazonaws.com
     Description: >
-      Service principal allowed to assume the Git sync role. AWS-owned, so it is
-      read from the account rather than assumed: this value is the one on the
-      AWSServiceRoleForGitSync service-linked role that AWS creates alongside a
-      Git sync setup. check-roles.sh prints it, so a drift shows up there first.
+      Service principal allowed to assume the Git sync role. Confirmed by the
+      sync configuration wizard, which rejects any other value with:
+      "The supplied role ... does not trust cloudformation.sync.codeconnections
+      .amazonaws.com".
 
-      Note it is 'repository.sync...', not 'cloudformation.sync...'. If the sync
-      configuration ever refuses the role, re-read the value and override this
-      parameter rather than editing the policy below.
+      Two values that look right and are not:
+        cloudformation.amazonaws.com                      - the CloudFormation
+          EXECUTION role's principal (wizard step 1), not the sync role's.
+        repository.sync.codeconnections.amazonaws.com      - what the
+          AWSServiceRoleForGitSync service-linked role trusts. Different role,
+          different purpose. Do not copy it.
+
+      Getting this wrong fails loudly at the wizard, not silently, so a rebuild
+      cannot quietly end up with a sync that never fires.
 
 Resources:
 

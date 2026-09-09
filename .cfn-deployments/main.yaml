@@ -13,17 +13,27 @@ parameters:
   #               pipeline. Use it for the first deployment.
   # full       -> adds them. Switch only after the application repository has
   #               pushed its first image to ECR.
-  DeployStage: full
+  # Start a fresh account at 'foundation'. The ECS service cannot reach a steady
+  # state until an image exists in ECR, and this stack creates the ECR repository
+  # and the role that pushes to it. Switch to 'full' after the first image lands.
+  DeployStage: foundation
 
   GitHubOrg: muhumuza-ivan
   AppRepoName: photo-gallery-app
   AppRepoBranch: main
 
-  # An IAM OIDC provider is account-scoped and only one may exist per URL. This
-  # account already has one for token.actions.githubusercontent.com, so the stack
-  # reuses it instead of trying to create a second and failing with AlreadyExists.
-  CreateOidcProvider: 'false'
-  ExistingOidcProviderArn: 'arn:aws:iam::765812221756:oidc-provider/token.actions.githubusercontent.com'
+  # An IAM OIDC provider is account-scoped and only one may exist per URL, so this
+  # is account-specific and MUST be checked when rebuilding in a new account:
+  #
+  #   aws iam list-open-id-connect-providers \
+  #     --query "OpenIDConnectProviderList[?contains(Arn,'token.actions.githubusercontent.com')].Arn" \
+  #     --output text
+  #
+  # Empty result -> leave CreateOidcProvider 'true' and the ARN empty.
+  # An ARN       -> set CreateOidcProvider 'false' and paste that ARN below,
+  #                 otherwise the stack fails with AlreadyExists on the provider.
+  CreateOidcProvider: 'true'
+  ExistingOidcProviderArn: ''
 
   # This GitHub account issues immutable subject claims - the owner and repository
   # IDs are embedded, so the classic repo:owner/name form would never match and the
